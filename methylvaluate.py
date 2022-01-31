@@ -10,7 +10,7 @@ import collections
 import numpy as np
 import os
 import seaborn as sns
-import pandas
+import pandas as pd
 import math
 from scipy.stats import pearsonr
 from enum import Enum
@@ -20,6 +20,11 @@ from datetime import datetime
 FWD_STRAND = "+"
 REV_STRAND = "-"
 
+METHYL_Q = "methyl_query"
+METHYL_T = "methyl_truth"
+DEPTH_Q = "depth_query"
+DEPTH_T = "depth_truth"
+
 
 class MethylBedType(Enum):
     UCSC_GENOME_BROWSER_BISULFITE = "UCSC_GENOME_BROWSER_BISULFITE"
@@ -27,6 +32,7 @@ class MethylBedType(Enum):
     UNSTRANDED_RATIO_DOUBLE_BP = "UNSTRANDED_RATIO_DOUBLE_BP"
     PEPPER_OUTPUT = "PEPPER_OUTPUT"
     SIMPLE_BED = "SIMPLE_BED"
+    BISMARK = "BISMARK"
     @staticmethod
     def from_string(id):
         for mbt in MethylBedType:
@@ -43,6 +49,8 @@ class MethylBedType(Enum):
 class ComparisonType(Enum):
     RECORD_OVERLAP = "RECORD_OVERLAP"
     BOOLEAN_CLASSIFICATION_BY_THRESHOLDS = "BOOLEAN_CLASSIFICATION_BY_THRESHOLDS"
+    BUCKETED_METHLYATION_LEVEL = "BUCKETED_METHLYATION_LEVEL"
+    METHYLATION_LEVEL_DIFFERENCE = "METHYLATION_LEVEL_DIFFERENCE"
     @staticmethod
     def from_string(id):
         for mbt in ComparisonType:
@@ -80,7 +88,7 @@ class MethylLocus:
             self.end_pos = int(parts[2])
             self.strand = parts[5]
             self.coverage = int(parts[9])
-            self.methyl_ratio = int(parts[10]) / 100.0
+            self.methyl_ratio = float(parts[10]) / 100.0
             self.methyl_count = round(self.coverage * self.methyl_ratio)
         elif type == MethylBedType.STRANDED_RATIO_SINGLE_BP:
             parts = line.split()
@@ -118,6 +126,15 @@ class MethylLocus:
             self.end_pos = int(parts[2])
             self.strand = parts[4]
             self.methyl_ratio = 1.0
+        elif type == MethylBedType.BISMARK:
+            parts = line.split()
+            if len(parts) <= 4: raise Exception("Badly formatted {} record: {}".format(type, line))
+            self.chr = parts[0]
+            self.start_pos = int(parts[1])
+            self.end_pos = int(parts[2])
+            self.methyl_count = int(parts[4])
+            self.coverage = int(parts[5]) + self.methyl_count
+            self.methyl_ratio = 0.0 if self.coverage == 0 else self.methyl_count / self.coverage
         else:
             raise Exception("Unknown MethylBedType: {}".format(type))
 
@@ -126,9 +143,9 @@ class MethylLocus:
         assert self.strand in (FWD_STRAND, REV_STRAND, None)
 
     def __str__(self):
-        return "MethylRecord({}:{}{} {}/{})".format(self.chr, self.start_pos,
+        return "MethylRecord({}:{}{} {} {})".format(self.chr, self.start_pos,
             "-{}".format(self.end_pos) if self.strand is None else " {}".format(self.strand),
-            self.methyl_count, self.coverage)
+            self.methyl_ratio, "" if self.call_confidence is None else self.call_confidence)
 
     def __lt__(self, other):
         if self.chr != other.chr:
@@ -172,13 +189,20 @@ def parse_args():
 
     # how to classify
     parser.add_argument('--comparison_type', '-y', dest='comparison_type', required=False,
-                        default=ComparisonType.RECORD_OVERLAP, type=ComparisonType.from_string,
-                        help='Truth methylation BED file format (default: RECORD_OVERLAP, possible values: {})'.format([x.value for x in ComparisonType]))
+                        default=ComparisonType.BUCKETED_METHLYATION_LEVEL, type=ComparisonType.from_string,
+                        help='Truth methylation BED file format (default: BUCKETED_METHLYATION_LEVEL, possible values: {})'.format([x.value for x in ComparisonType]))
     parser.add_argument('--truth_boolean_methyl_threshold', '-P', dest='truth_boolean_methyl_threshold', required=False, default=.9, type=float,
                        help='Threshold used to quantify boolean methylation state in truth')
     parser.add_argument('--query_boolean_methyl_threshold', '-p', dest='query_boolean_methyl_threshold', required=False, default=.9, type=float,
                        help='Threshold used to quantify boolean methylation state in query')
-
+    parser.add_argument('--bucket_count', '-b', dest='bucket_count', required=False, default=5, type=int,
+                       help='Number of buckets to use during BUCKETED_METHLYATION_LEVEL comparison, ie "3" results in buckets of 0-.33,.33-.66,.66-1.0')
+    parser.add_argument('--acceptable_methyl_difference', '-d', dest='acceptable_methyl_difference', required=False, default=.1, type=float,
+                       help='Difference in methyl ratio to count as TP, ie ".1" results in a TP for T:0.7,Q:0.65, FP for T:0.2,Q:0.6, FN for T:0.4,Q:0.1')
+    parser.add_argument('--only_count_matched_sites', '-m', dest='only_count_matched_sites', required=False, action='store_true', default=False,
+                        help="Only count matched sites during analyses (does not apply to RECORD_OVERLAP)")
+    parser.add_argument('--min_depth', '-D', dest='min_depth', required=False, default=0, type=int,
+                       help='Calls with depth below this value will not be considered')
     # output
     parser.add_argument('--output_base', '-o', dest='output_base', required=False, type=str, default=None,
                         help="Base output filenames on this parameter.  If set, will write annotated BED files")
@@ -193,7 +217,7 @@ def parse_args():
 
 def log(msg, log_time=True):
     print("{}{}".format("" if not log_time else "[{}] ".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                        msg), file=sys.stderr)
+                        msg), file=sys.stderr, flush=True)
 
 
 def filter_methyls_by_confidence(methyl_records, confidence_records, contigs_to_analyze, methyl_identifier):
@@ -227,7 +251,9 @@ def filter_methyls_by_confidence(methyl_records, confidence_records, contigs_to_
 def get_output_base(args, filename=None):
     if args.output_base is not None:
         return args.output_base
-    return strip_suffixes(os.path.basename(filename if filename is None else args.query), ".bed")
+    if args.output_from_filename:
+        return strip_suffixes(os.path.basename(filename if filename is not None else args.query), ".bed")
+    return None
 
 
 def strip_suffixes(string, suffixes):
@@ -296,22 +322,28 @@ def write_output_files(args, truth_records, query_records, contigs_to_analyze):
         if full_out is not None: full_out.close()
 
 
-def plot_roc(args, truth_records, query_records, contigs_to_analyze, bucket_count=60):
+def plot_roc(args, truth_records, query_records, contigs_to_analyze, bucket_count=32):
     # sanity check
+    get_confidence = lambda x: x.call_confidence
     if not MethylBedType.has_confidence_value(args.query_format):
-        log("Cannot produce ROC plot because query format {} does not have confidence values".format(args.query_format))
-        return
+        log("Query format {} does not have confidence values".format(args.query_format))
+        if args.query_format in [MethylBedType.STRANDED_RATIO_SINGLE_BP, MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP]:
+            log("Using depth as proxy for confidence")
+            get_confidence = lambda x: x.coverage
+        else:
+            return
+
 
     # get confidence range
     min_confidence = sys.maxsize
     max_confidence = 0
     for contig in contigs_to_analyze:
         for record in query_records[contig]:
-            if record.call_confidence is None:
+            if get_confidence(record) is None:
                 log("Query record {} had no confidence value, cannot produce ROC plot".format(record))
                 return
-            min_confidence = min(record.call_confidence, min_confidence)
-            max_confidence = max(record.call_confidence, max_confidence)
+            min_confidence = min(get_confidence(record), min_confidence)
+            max_confidence = max(get_confidence(record), max_confidence)
     if max_confidence <= min_confidence:
         log("Got unusable confidence range {}-{}, cannot produce ROC plot".format(min_confidence, max_confidence))
         return
@@ -334,7 +366,10 @@ def plot_roc(args, truth_records, query_records, contigs_to_analyze, bucket_coun
     # classify query records by confidence
     for contig in contigs_to_analyze:
         for record in query_records[contig]:
-            bucket = get_confidence_bucket(record.call_confidence)
+            bucket = get_confidence_bucket(get_confidence(record))
+            if type(record.record_classification) is not RecordClassification:
+                log("Unexpected record classification {} for {}".format(record.record_classification, record))
+                continue
             idx = get_classification_idx(record.record_classification)
             classification_by_confidence[bucket][idx] += 1
 
@@ -399,6 +434,163 @@ def plot_roc(args, truth_records, query_records, contigs_to_analyze, bucket_coun
     plt.close()
 
 
+def plot_bucketed_heatmap(buckets, args, fig_size=(8,8)):
+    # sanity check
+    if len(buckets) == 0:
+        log("No bucketed Truth/Query comparisons")
+        return
+
+    # printing text
+    print()
+    labels = ["{:.2f}-{:.2f}".format(x/args.bucket_count, (x+1)/args.bucket_count) for x in range(args.bucket_count)]
+    max_size = max(max(list(map(len, labels))), max(list(map(lambda y: max([len(str(buckets[y][x])) for x in range(args.bucket_count)]), buckets))))
+    element_format_str = " {:>" + str(max_size) + "s} "
+    print(element_format_str.format("T=y, Q=x"), end="")
+    for label in labels:
+        print(element_format_str.format(label), end="")
+    print()
+    for i in range(args.bucket_count):
+        print(element_format_str.format(labels[i]), end="")
+        for m in range(args.bucket_count):
+            print(element_format_str.format(str(buckets[i][m])), end="")
+        print()
+    print("", flush=True)
+
+
+    # plot it
+    use_log = True
+    # use_log = False
+    fig, ax = plt.subplots(figsize=fig_size)
+    pair_maps = [[buckets[y][x] for x in range(args.bucket_count)] for y in range(args.bucket_count -1, -1, -1)]
+    log_pair_maps = [[0 if buckets[y][x] == 0 else math.log10(buckets[y][x]) for x in range(args.bucket_count)] for y in range(args.bucket_count -1, -1, -1)]
+    if use_log:
+        im = ax.imshow(log_pair_maps)
+    else:
+        im = ax.imshow(pair_maps)
+    cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+    if use_log:
+        pass
+        # cbar.ax.set_yticklabels([int(10 ** x) for x in cbar.ax.get_yticks()])
+    else:
+        cbar.ax.set_yticklabels([x for x in cbar.ax.get_yticks()])
+
+    # label ticks
+    ax.set_xticks([x for x in range(args.bucket_count)])
+    ax.set_yticks([x for x in range(args.bucket_count)])
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(reversed(labels))
+
+    # Rotate the tick labels and set their alignment.
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right",
+             rotation_mode="anchor")
+
+    # add labels
+    for i in range(args.bucket_count):
+        for j in range(args.bucket_count):
+            text = ax.text(j, i, pair_maps[i][j], ha="center", va="center", color="w", size=6)
+            # text = ax.text(j, i, "{:.2f}".format(log_pair_maps[i][j]) if use_log else pair_maps[i][j], ha="center", va="center", color="w", size=8)
+
+    plt.suptitle("Methyl Ratio Comparison", y=1)
+    ax.set_ylabel("Truth")
+    ax.set_xlabel("Query")
+    fig.tight_layout()
+    output_base = get_output_base(args)
+    if output_base is not None:
+        filename = "{}.bucketed_methyl_heatmap_{}.png".format(output_base, args.bucket_count)
+        log("Saving heatmap to {}".format(filename))
+        plt.savefig(filename)
+    plt.show()
+    plt.close()
+
+
+def plot_heatmap(query, truth, args, fig_size=10):
+    # get pearsonr
+    r, p = pearsonr(query, truth)
+    log("Pearson R correlation:\n\tR: {}\n\tP: {}".format(r, p))
+
+    # plot joint and clear scatter
+    ax1 = sns.jointplot(x=query, y=truth, height=fig_size, marginal_kws=dict(bins=args.bucket_count))
+    ax1.ax_marg_x.text(1.05, 1, "Pearson's R: {:.3f}\n".format(r), ha="left", va="bottom", color="black", size=10)
+    ax1.ax_joint.cla()
+    plt.sca(ax1.ax_joint)
+
+    # plot scatter + colobar
+    plt.hist2d(query,truth,args.bucket_count,norm=colors.LogNorm(),cmap=sns.color_palette("viridis", as_cmap=True))
+    cbar_ax = ax1.fig.add_axes([1, 0.1, .03, .7])
+    cb = plt.colorbar(cax=cbar_ax)
+    cb.set_label(r'$\log_{10}$ density',fontsize=13)
+
+    # put colorbar in the right spot
+    plt.subplots_adjust(left=0.1, right=0.8, top=0.9, bottom=0.1)
+    # get the current positions of the joint ax and the ax for the marginal x
+    pos_joint_ax = ax1.ax_joint.get_position()
+    pos_marg_x_ax = ax1.ax_marg_x.get_position()
+    # reposition the joint ax so it has the same width as the marginal x ax
+    ax1.ax_joint.set_position([pos_joint_ax.x0, pos_joint_ax.y0, pos_marg_x_ax.width, pos_joint_ax.height])
+    # reposition the colorbar using new x positions and y positions of the joint ax
+    ax1.fig.axes[-1].set_position([.83, pos_joint_ax.y0, .04, pos_joint_ax.height])
+
+    # labels
+    plt.suptitle("Methyl Ratio Comparison", y=1)
+    ax1.ax_joint.set_ylabel("Truth")
+    ax1.ax_joint.set_xlabel("Query")
+
+    # save
+    output_base = get_output_base(args)
+    if output_base is not None:
+        filename = "{}.jointplot_heatmap_{}.png".format(output_base, args.bucket_count)
+        log("Saving heatmap to {}".format(filename))
+        plt.savefig(filename)
+    plt.show()
+    plt.close()
+
+
+
+def plot_differential_methylation(differences, args):
+    if len(differences) == 0:
+        log("No compared differences")
+        return
+
+    print()
+    print("Made {} comparisons".format(len(differences)))
+    print("\tAvg difference:     {:.5f}".format(np.mean(differences)))
+    print("\tAvg abs difference: {:.5f}".format(np.mean(list(map(abs,differences)))))
+    print("", flush=True)
+
+    difference_size = args.acceptable_methyl_difference
+    differences_factors = collections.defaultdict(lambda: 0)
+
+    for d in differences:
+        idx = int(d / difference_size)
+        differences_factors[idx] += 1
+
+    xs = []
+    ys = []
+    x0 = min(differences_factors.keys())
+    xn = max(differences_factors.keys())
+    x = x0
+    while x <= xn:
+        xs.append(x)
+        ys.append(differences_factors[x])
+        x += 1
+
+    plt.bar(xs, ys)
+
+    plt.xticks(xs, ["{}x".format(x) for x in xs])
+
+    plt.title("Methylation Difference Factors")
+    plt.xlabel("Difference Factor\n(based on acceptable difference of {}%)".format(int(100 * difference_size)))
+    plt.ylabel("Count")
+    plt.tight_layout()
+    output_base = get_output_base(args)
+    if output_base is not None:
+        filename = "{}.methyl_difference_factor_{}.png".format(output_base, int(100 * difference_size))
+        log("Saving heatmap to {}".format(filename))
+        plt.savefig(filename)
+    plt.show()
+    plt.close()
+
+
 def main():
     args = parse_args()
 
@@ -413,6 +605,14 @@ def main():
         log("Comparing using {} with truth threshold {} and query threshold {}".format(
             ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS, args.truth_boolean_methyl_threshold,
             args.query_boolean_methyl_threshold))
+    elif args.comparison_type == ComparisonType.BUCKETED_METHLYATION_LEVEL:
+        log ("Comparing using {} with bucket count {}".format(ComparisonType.BUCKETED_METHLYATION_LEVEL,
+                                                              args.bucket_count))
+        assert(args.bucket_count > 0)
+    elif args.comparison_type == ComparisonType.METHYLATION_LEVEL_DIFFERENCE:
+        log ("Comparing using {} with bucket count {}".format(ComparisonType.METHYLATION_LEVEL_DIFFERENCE,
+                                                              args.acceptable_methyl_difference))
+        assert(args.acceptable_methyl_difference > 0.0 and args.acceptable_methyl_difference < 1.0)
     else:
         raise Exception("Unhandled comparison type: {}".format(args.comparison_type))
 
@@ -451,6 +651,8 @@ def main():
         methyl_list.sort(key=lambda x: x.start_pos)
     record_count = sum(list(map(len, query_records.values())))
     log("Got {} query methyl records over {} contigs".format(record_count, len(query_records)))
+
+    #TODO convert single base loci to combined multi-base locus
 
     # get intersection and loggit
     contigs_to_analyze = list(set(truth_records.keys()).intersection(set(query_records.keys())))
@@ -497,6 +699,19 @@ def main():
     tn_records = list()
     contigs_to_analyze.sort()
 
+    # prep for bucketed analysis
+    bucket_counter = collections.defaultdict(lambda : collections.defaultdict( lambda : int(0)))
+    get_methyl_bucket = lambda x: min(args.bucket_count - 1, int(x * args.bucket_count))
+    sufficient_depth = lambda t,q: (t is None or t.coverage >= args.min_depth) and (q is None or q.coverage >= args.min_depth)
+    insufficient_depth_count = 0
+
+    # for seaborn plotting
+    raw_matched_entries_methyl_query = list()
+    raw_matched_entries_methyl_truth = list()
+
+    # prep for differential analysis
+    methyl_differences = list()
+
     # iterate over contigs
     for contig in contigs_to_analyze:
         # iterate over each pair, advancing one (or both) at each step
@@ -508,30 +723,67 @@ def main():
 
             # we have the same locus (true positive candidate)
             if curr_truth == curr_query:
-                if args.comparison_type == ComparisonType.RECORD_OVERLAP:
-                    tp_records.append((curr_truth, curr_query))
-                    curr_truth.record_classification = RecordClassification.TP
-                    curr_query.record_classification = RecordClassification.TP
-                elif args.comparison_type == ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS:
-                    truth_is_methyl = curr_truth.methyl_ratio >= args.truth_boolean_methyl_threshold
-                    query_is_methyl = curr_query.methyl_ratio >= args.query_boolean_methyl_threshold
-                    if truth_is_methyl and query_is_methyl:
+                if not sufficient_depth(curr_truth, curr_query):
+                    insufficient_depth_count += 1
+                else:
+                    raw_matched_entries_methyl_query.append(curr_query.methyl_ratio)
+                    raw_matched_entries_methyl_truth.append(curr_truth.methyl_ratio)
+                    if args.comparison_type == ComparisonType.RECORD_OVERLAP:
                         tp_records.append((curr_truth, curr_query))
                         curr_truth.record_classification = RecordClassification.TP
                         curr_query.record_classification = RecordClassification.TP
-                    elif truth_is_methyl:
-                        fn_records.append((curr_truth, curr_query))
-                        curr_truth.record_classification = RecordClassification.FN
-                        curr_query.record_classification = RecordClassification.FN
-                    elif query_is_methyl:
-                        fp_records.append((curr_truth, curr_query))
-                        curr_truth.record_classification = RecordClassification.FP
-                        curr_query.record_classification = RecordClassification.FP
-                    else:
-                        tn_records.append((curr_truth, curr_query))
-                        curr_truth.record_classification = RecordClassification.TN
-                        curr_query.record_classification = RecordClassification.TN
+                    elif args.comparison_type == ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS:
+                        truth_is_methyl = curr_truth.methyl_ratio >= args.truth_boolean_methyl_threshold
+                        query_is_methyl = curr_query.methyl_ratio >= args.query_boolean_methyl_threshold
+                        if truth_is_methyl and query_is_methyl:
+                            tp_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.TP
+                            curr_query.record_classification = RecordClassification.TP
+                        elif truth_is_methyl:
+                            fn_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.FN
+                            curr_query.record_classification = RecordClassification.FN
+                        elif query_is_methyl:
+                            fp_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.FP
+                            curr_query.record_classification = RecordClassification.FP
+                        else:
+                            tn_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.TN
+                            curr_query.record_classification = RecordClassification.TN
+                    elif args.comparison_type == ComparisonType.BUCKETED_METHLYATION_LEVEL:
+                        truth_bucket = get_methyl_bucket(curr_truth.methyl_ratio)
+                        query_bucket = get_methyl_bucket(curr_query.methyl_ratio)
+                        bucket_counter[truth_bucket][query_bucket] += 1
+                        if truth_bucket == query_bucket:
+                            tp_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.TP
+                            curr_query.record_classification = RecordClassification.TP
+                        elif query_bucket > truth_bucket:
+                            fp_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.FP
+                            curr_query.record_classification = RecordClassification.FP
+                        else:
+                            fn_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.FN
+                            curr_query.record_classification = RecordClassification.FN
+                    elif args.comparison_type == ComparisonType.METHYLATION_LEVEL_DIFFERENCE:
+                        methyl_difference = curr_truth.methyl_ratio - curr_query.methyl_ratio
+                        methyl_differences.append(methyl_difference)
+                        if abs(methyl_difference) <= args.acceptable_methyl_difference:
+                            tp_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.TP
+                            curr_query.record_classification = RecordClassification.TP
+                        elif curr_truth.methyl_ratio < curr_query.methyl_ratio:
+                            fp_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.FP
+                            curr_query.record_classification = RecordClassification.FP
+                        else:
+                            fn_records.append((curr_truth, curr_query))
+                            curr_truth.record_classification = RecordClassification.FN
+                            curr_query.record_classification = RecordClassification.FN
 
+                # iterate
                 curr_truth.paired_record = curr_query
                 curr_query.paired_record = curr_truth
                 curr_truth = next(truth_iter, None)
@@ -539,32 +791,70 @@ def main():
 
             # only a truth record at this locus (false negative)
             elif curr_truth < curr_query:
-                if args.comparison_type == ComparisonType.RECORD_OVERLAP:
-                    fn_records.append((curr_truth, None))
-                    curr_truth.record_classification = RecordClassification.FN
-                elif args.comparison_type == ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS:
-                    truth_is_methyl = curr_truth.methyl_ratio >= args.truth_boolean_methyl_threshold
-                    if truth_is_methyl:
+                if not sufficient_depth(curr_truth, curr_query):
+                    insufficient_depth_count += 1
+                else:
+                    if args.comparison_type == ComparisonType.RECORD_OVERLAP:
                         fn_records.append((curr_truth, None))
                         curr_truth.record_classification = RecordClassification.FN
-                    else:
-                        tn_records.append((curr_truth, None))
-                        curr_truth.record_classification = RecordClassification.TN
+                    elif args.only_count_matched_sites:
+                        pass
+                    elif args.comparison_type == ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS:
+                        truth_is_methyl = curr_truth.methyl_ratio >= args.truth_boolean_methyl_threshold
+                        if truth_is_methyl:
+                            fn_records.append((curr_truth, None))
+                            curr_truth.record_classification = RecordClassification.FN
+                        else:
+                            tn_records.append((curr_truth, None))
+                            curr_truth.record_classification = RecordClassification.TN
+                    elif args.comparison_type == ComparisonType.BUCKETED_METHLYATION_LEVEL:
+                        fn_records.append((curr_truth, None))
+                        curr_truth.record_classification = RecordClassification.FN
+                    elif args.comparison_type == ComparisonType.METHYLATION_LEVEL_DIFFERENCE:
+                        methyl_difference = curr_truth.methyl_ratio
+                        methyl_differences.append(methyl_difference)
+                        if methyl_difference <= args.acceptable_methyl_difference:
+                            tp_records.append((curr_truth, None))
+                            curr_truth.record_classification = RecordClassification.TP
+                        else:
+                            fn_records.append((curr_truth, None))
+                            curr_truth.record_classification = RecordClassification.FN
+
+                # iterate
                 curr_truth = next(truth_iter, None)
 
             # only a query record at this locus (false positive)
             elif curr_query < curr_truth:
-                if args.comparison_type == ComparisonType.RECORD_OVERLAP:
-                    fp_records.append((None, curr_query))
-                    curr_query.record_classification = RecordClassification.FP
-                elif args.comparison_type == ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS:
-                    query_is_methyl = curr_query.methyl_ratio >= args.query_boolean_methyl_threshold
-                    if query_is_methyl:
+                if not sufficient_depth(curr_truth, curr_query):
+                    insufficient_depth_count += 1
+                else:
+                    if args.comparison_type == ComparisonType.RECORD_OVERLAP:
                         fp_records.append((None, curr_query))
                         curr_query.record_classification = RecordClassification.FP
-                    else:
-                        tn_records.append((None, curr_query))
-                        curr_query.record_classification = RecordClassification.TN
+                    elif args.only_count_matched_sites:
+                        pass
+                    elif args.comparison_type == ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS:
+                        query_is_methyl = curr_query.methyl_ratio >= args.query_boolean_methyl_threshold
+                        if query_is_methyl:
+                            fp_records.append((None, curr_query))
+                            curr_query.record_classification = RecordClassification.FP
+                        else:
+                            tn_records.append((None, curr_query))
+                            curr_query.record_classification = RecordClassification.TN
+                    elif args.comparison_type == ComparisonType.BUCKETED_METHLYATION_LEVEL:
+                        fp_records.append((None, curr_query))
+                        curr_query.record_classification = RecordClassification.FP
+                    elif args.comparison_type == ComparisonType.METHYLATION_LEVEL_DIFFERENCE:
+                        methyl_difference = curr_query.methyl_ratio
+                        methyl_differences.append( -1 * methyl_difference)
+                        if methyl_difference <= args.acceptable_methyl_difference:
+                            tp_records.append((None, curr_query))
+                            curr_truth.record_classification = RecordClassification.TP
+                        else:
+                            fp_records.append((None, curr_query))
+                            curr_truth.record_classification = RecordClassification.FP
+
+                # iterate
                 curr_query = next(query_iter, None)
 
             # should not happen
@@ -572,6 +862,7 @@ def main():
                 raise Exception("Programmer Error: encountered unexpected edge case analyzing "
                                 "truth '{}' and query '{}'".format(curr_truth, curr_query))
 
+    log("Excluded {} sites because of insufficient depth".format(insufficient_depth_count))
     # actual stats
     tp = len(tp_records)
     fp = len(fp_records)
@@ -596,7 +887,13 @@ def main():
     # plot
     if args.plot:
         log("Plotting")
-        plot_roc(args, truth_records, query_records, contigs_to_analyze)
+        plot_heatmap(raw_matched_entries_methyl_query, raw_matched_entries_methyl_truth, args)
+        if args.comparison_type == ComparisonType.RECORD_OVERLAP or args.comparison_type == ComparisonType.BOOLEAN_CLASSIFICATION_BY_THRESHOLDS:
+            plot_roc(args, truth_records, query_records, contigs_to_analyze)
+        if args.comparison_type == ComparisonType.BUCKETED_METHLYATION_LEVEL:
+            plot_bucketed_heatmap(bucket_counter, args)
+        if args.comparison_type == ComparisonType.METHYLATION_LEVEL_DIFFERENCE:
+            plot_differential_methylation(methyl_differences, args)
 
     log("Fin.")
 
