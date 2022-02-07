@@ -67,7 +67,7 @@ class RecordClassification(Enum):
 
 
 class MethylLocus:
-    def __init__(self, line, type):
+    def __init__(self, line, bed_type):
         self.chr = None
         self.start_pos = None
         self.end_pos = None
@@ -78,11 +78,11 @@ class MethylLocus:
         self.call_confidence = None
         self.record_classification = None
         self.paired_record = None
-        self.type = type
+        self.type = bed_type
 
-        if type == MethylBedType.UCSC_GENOME_BROWSER_BISULFITE:
+        if bed_type == MethylBedType.UCSC_GENOME_BROWSER_BISULFITE:
             parts = line.split()
-            if len(parts) < 11: raise Exception("Badly formatted {} record: {}".format(type, line))
+            if len(parts) < 11: raise Exception("Badly formatted {} record: {}".format(bed_type, line))
             self.chr = parts[0]
             self.start_pos = int(parts[1])
             self.end_pos = int(parts[2])
@@ -90,9 +90,9 @@ class MethylLocus:
             self.coverage = int(parts[9])
             self.methyl_ratio = float(parts[10]) / 100.0
             self.methyl_count = round(self.coverage * self.methyl_ratio)
-        elif type == MethylBedType.STRANDED_RATIO_SINGLE_BP:
+        elif bed_type == MethylBedType.STRANDED_RATIO_SINGLE_BP:
             parts = line.split()
-            if len(parts) < 6: raise Exception("Badly formatted {} record: {}".format(type, line))
+            if len(parts) < 6: raise Exception("Badly formatted {} record: {}".format(bed_type, line))
             self.chr = parts[0]
             self.start_pos = int(parts[1])
             self.end_pos = int(parts[2])
@@ -100,35 +100,46 @@ class MethylLocus:
             self.methyl_count = int(parts[4])
             self.coverage = int(parts[5])
             self.methyl_ratio = 1.0 * self.methyl_count / self.coverage
-        elif type == MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP:
+        elif bed_type == MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP:
+            if type(line) == str:
+                parts = line.split()
+                if len(parts) < 5: raise Exception("Badly formatted {} record: {}".format(bed_type, line))
+                self.chr = parts[0]
+                self.start_pos = int(parts[1])
+                self.end_pos = int(parts[2])
+                self.coverage = int(parts[3])
+                self.methyl_ratio = float(parts[4])
+                self.methyl_count = round(self.coverage * self.methyl_ratio)
+            elif type(line) == tuple:
+                prev, curr = line
+                if type(prev) != MethylLocus or type(curr) != MethylLocus or not prev < curr:
+                    raise Exception("Unexpected input to {} constructor: {}".format(MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP, line))
+                self.chr = prev.chr
+                self.start_pos = prev.start_pos
+                self.end_pos = curr.end_pos
+                self.coverage = prev.coverage + curr.coverage
+                self.methyl_count = prev.methyl_count + curr.methyl_count
+                self.methyl_ratio = 1.0 * self.methyl_count / self.coverage
+        elif bed_type == MethylBedType.PEPPER_OUTPUT:
             parts = line.split()
-            if len(parts) < 5: raise Exception("Badly formatted {} record: {}".format(type, line))
-            self.chr = parts[0]
-            self.start_pos = int(parts[1])
-            self.end_pos = int(parts[2])
-            self.coverage = int(parts[3])
-            self.methyl_ratio = float(parts[4])
-            self.methyl_count = round(self.coverage * self.methyl_ratio)
-        elif type == MethylBedType.PEPPER_OUTPUT:
-            parts = line.split()
-            if len(parts) <= 5: raise Exception("Badly formatted {} record: {}".format(type, line))
+            if len(parts) <= 5: raise Exception("Badly formatted {} record: {}".format(bed_type, line))
             self.chr = parts[0]
             self.start_pos = int(parts[1])
             self.end_pos = int(parts[2])
             self.strand = parts[4]
             self.call_confidence = float(parts[5])
             self.methyl_ratio = 1.0
-        elif type == MethylBedType.SIMPLE_BED:
+        elif bed_type == MethylBedType.SIMPLE_BED:
             parts = line.split()
-            if len(parts) <= 4: raise Exception("Badly formatted {} record: {}".format(type, line))
+            if len(parts) <= 4: raise Exception("Badly formatted {} record: {}".format(bed_type, line))
             self.chr = parts[0]
             self.start_pos = int(parts[1])
             self.end_pos = int(parts[2])
             self.strand = parts[4]
             self.methyl_ratio = 1.0
-        elif type == MethylBedType.BISMARK:
+        elif bed_type == MethylBedType.BISMARK:
             parts = line.split()
-            if len(parts) <= 4: raise Exception("Badly formatted {} record: {}".format(type, line))
+            if len(parts) <= 4: raise Exception("Badly formatted {} record: {}".format(bed_type, line))
             self.chr = parts[0]
             self.start_pos = int(parts[1])
             self.end_pos = int(parts[2])
@@ -136,7 +147,7 @@ class MethylLocus:
             self.coverage = int(parts[5]) + self.methyl_count
             self.methyl_ratio = 0.0 if self.coverage == 0 else self.methyl_count / self.coverage
         else:
-            raise Exception("Unknown MethylBedType: {}".format(type))
+            raise Exception("Unknown MethylBedType: {}".format(bed_type))
 
         # sanity
         assert self.start_pos <= self.end_pos
@@ -156,6 +167,7 @@ class MethylLocus:
 
     def __eq__(self, other):
         return self.chr == other.chr and self.start_pos == other.start_pos and self.strand == other.strand
+
 
 
 class BedRecord:
@@ -203,6 +215,8 @@ def parse_args():
                         help="Only count matched sites during analyses (does not apply to RECORD_OVERLAP)")
     parser.add_argument('--min_depth', '-D', dest='min_depth', required=False, default=0, type=int,
                        help='Calls with depth below this value will not be considered')
+    parser.add_argument('--normalize_type', '-n', dest='normalize_type', required=False, action='store_true', default=False,
+                        help="Convert incoming records to {} type".format(MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP))
     # output
     parser.add_argument('--output_base', '-o', dest='output_base', required=False, type=str, default=None,
                         help="Base output filenames on this parameter.  If set, will write annotated BED files")
@@ -220,32 +234,61 @@ def log(msg, log_time=True):
                         msg), file=sys.stderr, flush=True)
 
 
+def convert_to_unstranded_double_bp_methyl_locus(methyl_records_in):
+    methyl_records_out = dict()
+    unconvertable_records = 0
+    for chr in methyl_records_in.keys():
+        methyl_records_out[chr] = list()
+        prev_methyl_record = None
+        for methyl_record in methyl_records_in[chr]:
+            # iterate if we don't have a prev to specify
+            if prev_methyl_record is None:
+                prev_methyl_record = methyl_record
+                continue
+
+            # determine if this is a pair
+            if prev_methyl_record.start_pos == methyl_record.start_pos - 1 and prev_methyl_record.strand == FWD_STRAND and methyl_record.strand == REV_STRAND:
+                new_methyl_record = MethylLocus((prev_methyl_record, methyl_record), MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP)
+                methyl_records_out[chr].append(new_methyl_record)
+                prev_methyl_record = None
+            else:
+                if unconvertable_records == 0:
+                    log("Unable to convert records {} and {} to {} type".format(prev_methyl_record, methyl_record, MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP))
+                unconvertable_records += 1
+                prev_methyl_record = methyl_record
+    log("Failed to convert {} ({}%) records to {} type".format(unconvertable_records,
+        int(unconvertable_records / sum(list(map(len, methyl_records_in.values())))),
+        MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP))
+    return methyl_records_out
+
+
+
 def filter_methyls_by_confidence(methyl_records, confidence_records, contigs_to_analyze, methyl_identifier):
-        skipped_methyl_record_count = 0
-        kept_methyl_record_count = 0
-        for contig in contigs_to_analyze:
-            kept_methyl_records = list()
-            conf_iter = iter(confidence_records[contig])
-            methyl_iter = iter(methyl_records[contig])
-            curr_conf = next(conf_iter, None)
-            curr_methyl = next(methyl_iter, None)
-            while curr_conf is not None and curr_methyl is not None:
-                if curr_conf.start_pos <= curr_methyl.start_pos and curr_methyl.end_pos <= curr_conf.end_pos:
-                    kept_methyl_records.append(curr_methyl)
-                    kept_methyl_record_count += 1
-                    curr_methyl = next(methyl_iter, None)
-                elif curr_methyl.start_pos <= curr_conf.start_pos:
-                    skipped_methyl_record_count += 1
-                    curr_methyl = next(methyl_iter, None)
-                elif curr_conf.end_pos <= curr_methyl.end_pos:
-                    curr_conf = next(conf_iter, None)
-                else:
-                    raise Exception("Programmer Error: encountered edge case filtering "
-                                    "{} records for methyl '{}' and confidence '{}'".format(
-                                        methyl_identifier, curr_methyl, curr_conf))
-            methyl_records[contig] = kept_methyl_records
-        log("Kept {} and discarded {} {} records based on confidence BED".format(
-            kept_methyl_record_count, skipped_methyl_record_count, methyl_identifier))
+    skipped_methyl_record_count = 0
+    kept_methyl_record_count = 0
+    for contig in contigs_to_analyze:
+        kept_methyl_records = list()
+        conf_iter = iter(confidence_records[contig])
+        methyl_iter = iter(methyl_records[contig])
+        curr_conf = next(conf_iter, None)
+        curr_methyl = next(methyl_iter, None)
+        while curr_conf is not None and curr_methyl is not None:
+            if curr_conf.start_pos <= curr_methyl.start_pos and curr_methyl.end_pos <= curr_conf.end_pos:
+                kept_methyl_records.append(curr_methyl)
+                kept_methyl_record_count += 1
+                curr_methyl = next(methyl_iter, None)
+            elif curr_methyl.start_pos <= curr_conf.start_pos:
+                skipped_methyl_record_count += 1
+                curr_methyl = next(methyl_iter, None)
+            elif curr_conf.end_pos <= curr_methyl.end_pos:
+                curr_conf = next(conf_iter, None)
+            else:
+                raise Exception("Programmer Error: encountered edge case filtering "
+                                "{} records for methyl '{}' and confidence '{}'".format(
+                                    methyl_identifier, curr_methyl, curr_conf))
+        methyl_records[contig] = kept_methyl_records
+    log("Kept {} and discarded {} {} records based on confidence BED".format(
+        kept_methyl_record_count, skipped_methyl_record_count, methyl_identifier))
 
 
 def get_output_base(args, filename=None):
@@ -265,6 +308,12 @@ def strip_suffixes(string, suffixes):
         if string.endswith(suffix):
             string = string[:(-1 * len(suffix))]
     return string
+
+def get_number_string(num):
+    if num < 1000: return str(num)
+    if num < 1000000: return str(int(num/1000))+"k"
+    if num < 1000000000: return str(int(num/1000000))+"M"
+    return str(int(num/1000000000))+"G"
 
 
 def write_output_files(args, truth_records, query_records, contigs_to_analyze):
@@ -487,7 +536,7 @@ def plot_bucketed_heatmap(buckets, args, fig_size=(8,8)):
     # add labels
     for i in range(args.bucket_count):
         for j in range(args.bucket_count):
-            text = ax.text(j, i, pair_maps[i][j], ha="center", va="center", color="w", size=6)
+            text = ax.text(j, i, get_number_string(pair_maps[i][j]), ha="center", va="center", color="w", size=6)
             # text = ax.text(j, i, "{:.2f}".format(log_pair_maps[i][j]) if use_log else pair_maps[i][j], ha="center", va="center", color="w", size=8)
 
     plt.suptitle("Methyl Ratio Comparison", y=1)
@@ -635,6 +684,8 @@ def main():
         methyl_list.sort(key=lambda x: x.start_pos)
     record_count = sum(list(map(len, truth_records.values())))
     log("Got {} truth methyl records over {} contigs".format(record_count, len(truth_records)))
+    if args.normalize_type and args.truth_format != MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP:
+        truth_records = convert_to_unstranded_double_bp_methyl_locus(truth_records)
 
     # read query file
     log("Reading query records from {} with format {}".format(args.query, args.query_format.value))
@@ -651,6 +702,8 @@ def main():
         methyl_list.sort(key=lambda x: x.start_pos)
     record_count = sum(list(map(len, query_records.values())))
     log("Got {} query methyl records over {} contigs".format(record_count, len(query_records)))
+    if args.normalize_type and args.query_format != MethylBedType.UNSTRANDED_RATIO_DOUBLE_BP:
+        query_records = convert_to_unstranded_double_bp_methyl_locus(query_records)
 
     #TODO convert single base loci to combined multi-base locus
 
